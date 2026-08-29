@@ -74,6 +74,7 @@
 #include "hamlibdatetime.h"
 #include "cache.h"
 #include "stream.h"
+#include "rig_internal.h"
 
 /**
  * \brief Hamlib short license name
@@ -279,7 +280,7 @@ typedef struct async_data_handler_priv_data_s
     async_data_handler_args args;
 } async_data_handler_priv_data;
 
-static int async_data_handler_start(RIG *rig);
+static int start_pthread(pthread_t *thread, void *(*routine)(void *), void *arg);
 static int async_data_handler_stop(RIG *rig);
 static void *async_data_handler(void *arg);
 
@@ -295,7 +296,6 @@ typedef struct morse_data_handler_priv_data_s
     int keyspd;
 } morse_data_handler_priv_data;
 
-static int morse_data_handler_start(RIG *rig);
 static int morse_data_handler_stop(RIG *rig);
 int morse_data_handler_set_keyspd(RIG *rig, int keyspd);
 static void *morse_data_handler(void *arg);
@@ -1128,7 +1128,6 @@ int HAMLIB_API rig_open(RIG *rig)
               "%s: async_data_enable=%d, async_data_supported=%d\n", __func__,
               rs->async_data_enabled, caps->async_data_supported);
     rs->async_data_enabled = rs->async_data_enabled && caps->async_data_supported;
-    rp->asyncio = rs->async_data_enabled;
 
     if (strlen(rp->pathname) > 0)
     {
@@ -1274,14 +1273,6 @@ int HAMLIB_API rig_open(RIG *rig)
         rs->comm_status = RIG_COMM_STATUS_ERROR;
         RETURNFUNC2(status);
     }
-
-    /*
-     * The sync pipes exist now, but asyncio routes every read through
-     * them and nothing writes to them until the reader thread runs.  Both
-     * this routine and the backend's open hook talk to the rig before
-     * that, so read straight from the port until the thread is up.
-     */
-    rp->asyncio = 0;
 
     switch (pttp->type.ptt)
     {
@@ -1597,7 +1588,7 @@ int HAMLIB_API rig_open(RIG *rig)
         RETURNFUNC2(RIG_OK);
     }
 
-    status = async_data_handler_start(rig);
+    status = rig_async_data_handler_start(rig, start_pthread);
 
     if (status < 0)
     {
@@ -1609,13 +1600,15 @@ int HAMLIB_API rig_open(RIG *rig)
     // Some models don't support CW so don't need morse handler
     if (rig->caps->send_morse)
     {
-        status = morse_data_handler_start(rig);
+        status = rig_morse_data_handler_start(rig, start_pthread);
 
         if (status < 0)
         {
             rig_debug(RIG_DEBUG_ERR, "%s: cw_data_handler_start failed: %.23000s\n", __func__,
                       rigerror(status));
+            async_data_handler_stop(rig);
             port_close(rp, rp->type.rig);
+            rs->comm_status = RIG_COMM_STATUS_ERROR;
             RETURNFUNC2(status);
         }
     }
@@ -8475,10 +8468,17 @@ void rig_lock(RIG *rig, int lock)
 
 #define MAX_FRAME_LENGTH 1024
 
-static int async_data_handler_start(RIG *rig)
+static int start_pthread(pthread_t *thread, void *(*routine)(void *), void *arg)
+{
+    return pthread_create(thread, NULL, routine, arg);
+}
+
+int rig_async_data_handler_start(RIG *rig,
+                                 hamlib_thread_start_t thread_start)
 {
     struct rig_state *rs = STATE(rig);
     async_data_handler_priv_data *async_data_handler_priv;
+    int status;
 
     ENTERFUNC;
 
@@ -8490,49 +8490,64 @@ static int async_data_handler_start(RIG *rig)
         RETURNFUNC(RIG_OK);
     }
 
+    if (thread_start == NULL)
+    {
+        RETURNFUNC(-RIG_EINVAL);
+    }
+
     sleep(2);  // give other things a chance to finish opening up the rig
 
-    rs->async_data_handler_thread_run = 1;
+    status = port_prepare_async(RIGPORT(rig));
+
+    if (status < 0)
+    {
+        RETURNFUNC(status);
+    }
+
     rs->async_data_handler_priv_data = calloc(1,
                                        sizeof(async_data_handler_priv_data));
 
     if (rs->async_data_handler_priv_data == NULL)
     {
-        rs->async_data_handler_thread_run = 0;
+        port_cleanup_async(RIGPORT(rig));
         RETURNFUNC(-RIG_ENOMEM);
     }
 
     async_data_handler_priv = (async_data_handler_priv_data *)
                               rs->async_data_handler_priv_data;
     async_data_handler_priv->args.rig = rig;
-    /* from here on the reader thread owns the port and feeds the pipes */
-    RIGPORT(rig)->asyncio = 1;
-    int err = pthread_create(&async_data_handler_priv->thread_id, NULL,
-                             async_data_handler, &async_data_handler_priv->args);
+    rs->async_data_handler_thread_run = 1;
+    int err = thread_start(&async_data_handler_priv->thread_id,
+                           async_data_handler, &async_data_handler_priv->args);
 
     if (err)
     {
-        /* nothing will feed the pipes, so hand the port back to direct reads */
-        RIGPORT(rig)->asyncio = 0;
         rs->async_data_handler_thread_run = 0;
         free(rs->async_data_handler_priv_data);
         rs->async_data_handler_priv_data = NULL;
+        port_cleanup_async(RIGPORT(rig));
         rig_debug(RIG_DEBUG_ERR, "%s: pthread_create error: %s\n", __func__,
                   strerror(err));
         RETURNFUNC(-RIG_EINTERNAL);
     }
 
+    RIGPORT(rig)->asyncio = 1;
     RETURNFUNC(RIG_OK);
 }
 
-static int morse_data_handler_start(RIG *rig)
+int rig_morse_data_handler_start(RIG *rig,
+                                 hamlib_thread_start_t thread_start)
 {
     struct rig_state *rs = STATE(rig);
     morse_data_handler_priv_data *morse_data_handler_priv;
 
     ENTERFUNC;
 
-    rs->morse_data_handler_thread_run = 1;
+    if (thread_start == NULL)
+    {
+        RETURNFUNC(-RIG_EINVAL);
+    }
+
     rs->morse_data_handler_priv_data = calloc(1,
                                        sizeof(morse_data_handler_priv_data));
 
@@ -8550,11 +8565,15 @@ static int morse_data_handler_start(RIG *rig)
     morse_data_handler_priv->keyspd = keyspd.i;
     rig_debug(RIG_DEBUG_VERBOSE, "%s(%d): keyspd=%d\n", __func__, __LINE__,
               keyspd.i);
-    int err = pthread_create(&morse_data_handler_priv->thread_id, NULL,
-                             morse_data_handler, &morse_data_handler_priv->args);
+    rs->morse_data_handler_thread_run = 1;
+    int err = thread_start(&morse_data_handler_priv->thread_id,
+                           morse_data_handler, &morse_data_handler_priv->args);
 
     if (err)
     {
+        rs->morse_data_handler_thread_run = 0;
+        free(rs->morse_data_handler_priv_data);
+        rs->morse_data_handler_priv_data = NULL;
         rig_debug(RIG_DEBUG_ERR, "%s: pthread_create error: %s\n", __func__,
                   strerror(err));
         RETURNFUNC(-RIG_EINTERNAL);
@@ -8599,9 +8618,7 @@ static int async_data_handler_stop(RIG *rig)
         rs->async_data_handler_priv_data = NULL;
     }
 
-    /* nothing feeds the pipes any more, so read straight from the port */
-    RIGPORT(rig)->asyncio = 0;
-
+    port_cleanup_async(RIGPORT(rig));
     RETURNFUNC(RIG_OK);
 }
 
