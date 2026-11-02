@@ -16,6 +16,7 @@
 #include "hamlib/rig_state.h"
 
 typedef int (*hamlib_thread_start_t)(pthread_t *thread,
+                                     const pthread_attr_t *attr,
                                      void *(*routine)(void *), void *arg);
 
 HL_PRIVATE extern HAMLIB_EXPORT(int)

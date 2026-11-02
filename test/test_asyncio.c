@@ -145,10 +145,11 @@ static RIG *new_test_rig(int async_enabled)
 }
 
 /* Deterministically exercise pthread_create() rollback without interposition. */
-static int fail_thread_start(pthread_t *thread, void *(*routine)(void *),
-                             void *arg)
+static int fail_thread_start(pthread_t *thread, const pthread_attr_t *attr,
+                             void *(*routine)(void *), void *arg)
 {
     (void) thread;
+    (void) attr;
     (void) routine;
     (void) arg;
     return EAGAIN;

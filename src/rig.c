@@ -298,7 +298,6 @@ typedef struct async_data_handler_priv_data_s
     async_data_handler_args args;
 } async_data_handler_priv_data;
 
-static int start_pthread(pthread_t *thread, void *(*routine)(void *), void *arg);
 static int async_data_handler_stop(RIG *rig);
 static void *async_data_handler(void *arg);
 
@@ -1648,7 +1647,7 @@ int HAMLIB_API rig_open(RIG *rig)
         RETURNFUNC2(RIG_OK);
     }
 
-    status = rig_async_data_handler_start(rig, start_pthread);
+    status = rig_async_data_handler_start(rig, pthread_create);
 
     if (status < 0)
     {
@@ -1660,7 +1659,7 @@ int HAMLIB_API rig_open(RIG *rig)
     // Some models don't support CW so don't need morse handler
     if (rig->caps->send_morse)
     {
-        status = rig_morse_data_handler_start(rig, start_pthread);
+        status = rig_morse_data_handler_start(rig, pthread_create);
 
         if (status < 0)
         {
@@ -8560,11 +8559,6 @@ void rig_lock(RIG *rig, int lock)
 
 #define MAX_FRAME_LENGTH 1024
 
-static int start_pthread(pthread_t *thread, void *(*routine)(void *), void *arg)
-{
-    return pthread_create(thread, NULL, routine, arg);
-}
-
 int rig_async_data_handler_start(RIG *rig,
                                  hamlib_thread_start_t thread_start)
 {
@@ -8606,7 +8600,7 @@ int rig_async_data_handler_start(RIG *rig,
     // Raised before the thread exists, so this write does not race the thread
     RIGPORT(rig)->asyncio = 1;
     rs->async_data_handler_thread_run = 1;
-    int err = thread_start(&async_data_handler_priv->thread_id,
+    int err = thread_start(&async_data_handler_priv->thread_id, NULL,
                            async_data_handler, &async_data_handler_priv->args);
 
     if (err)
@@ -8649,7 +8643,7 @@ int rig_morse_data_handler_start(RIG *rig,
     rig_debug(RIG_DEBUG_VERBOSE, "%s(%d): keyspd=%d\n", __func__, __LINE__,
               keyspd.i);
     rs->morse_data_handler_thread_run = 1;
-    int err = thread_start(&morse_data_handler_priv->thread_id,
+    int err = thread_start(&morse_data_handler_priv->thread_id, NULL,
                            morse_data_handler, &morse_data_handler_priv->args);
 
     if (err)
